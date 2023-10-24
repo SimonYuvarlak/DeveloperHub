@@ -3,11 +3,13 @@ module devhub::devcard {
     use std::string::{Self, String};
 
     use sui::transfer;
-    use sui::object::{Self, UID};
+    use sui::object::{Self, UID, ID};
     use sui::tx_context::{Self, TxContext};
     use sui::url::{Self, Url};
     use sui::coin::{Self, Coin};
     use sui::sui::SUI;
+    use sui::object_table::{Self, ObjectTable};
+    use sui::event;
 
     const NOT_THE_OWNER: u64 = 0;
     const INSUFFICIENT_FUNDS: u64 = 1;
@@ -19,7 +21,7 @@ module devhub::devcard {
     struct DevCard has key, store {
         id: UID,
         name: String,
-        address: address,
+        owner: address,
         title: String,
         img_url: Url,
         description: Option<String>,
@@ -32,37 +34,47 @@ module devhub::devcard {
 
     // This object has the owner of the contract.
     // We are going to send the tokens to this address of the user.
+    // Here we also store the cards, and will make this object shared so anyone can manipulate the cards they own
     struct DevHub has key {
         id: UID,
         owner: address,
+        counter: u64,
+        cards: ObjectTable<u64, DevCard>,
     }
 
-    // This objct will be send to the contract owner
-    // Only the owner can delete object. 
-    // To have this system, we are going to require that the transaction sender has the HubOwner object.
-    struct HubOwner has key {
-        id: UID
+    // This is an event
+    // This event will be emitted in the create_card function
+    struct CardCreated has copy, drop {
+        id: ID,
+        name: String,
+        owner: address,
+        title: String,
+        contact: String,
     }
+
+    // This is an event
+    // This event will be emitted in the update_card_description function
+    struct DescriptionUpdated has copy, drop {
+        name: String,
+        owner: address,
+        new_description: String
+    }
+
 
     // We are initating our contract.
-    // HubOwner object is created and sent to the sender of this transaction
-    // DevHub created an freezed as an immutable object. Anyone can read it but cannot write it
+    // DevHub created a shared object so that users can modify or alter their cards
     fun init(ctx: &mut TxContext) {
-        transfer::transfer(
-            HubOwner {id: object::new(ctx)},
-            tx_context::sender(ctx)
-        );
-        transfer::freeze_object(
+        transfer::share_object(
             DevHub {
                 id: object::new(ctx),
                 owner: tx_context::sender(ctx),
+                counter: 0,
+                cards: object_table::new(ctx),
             }
         );
     }
 
-    // This function creates new card
-    // To create the card, required amount should be paid
-    // We have the reference for a DevHub object so that the token that is paid to this function can be transferred to the owner using the owner field in the DevHub object
+    // This function creates new card and adds it to the table
     public entry fun create_card(
         name: vector<u8>,
         title: vector<u8>,
@@ -72,20 +84,36 @@ module devhub::devcard {
         portfolio: vector<u8>,
         contact: vector<u8>,
         payment: Coin<SUI>,
-        devhub: &DevHub,
+        devhub: &mut DevHub,
         ctx: &mut TxContext
     ) {
-        // In this part, we get the value that came with the transaction. 
-        // After we have the value, we transfer the tokens to the owner of the contract which we get it from DevHub object 
-        let value = coin::value(&payment);
-        assert!(value == MIN_CARD_COST, INSUFFICIENT_FUNDS);
-        transfer::transfer(payment, devhub.owner);
+        let value = coin::value(&payment); // get the tokens transferred with the transaction
+        assert!(value == MIN_CARD_COST, INSUFFICIENT_FUNDS); // check if the sent amount is correct
+        transfer::public_transfer(payment, devhub.owner); // tranfer the tokens
+
+        // Here we increase the counter before adding the card to the table
+        devhub.counter = devhub.counter + 1;
+
+        // Create new id
+        // Id is created here because we are going to use it with both devcard and the event
+        let id = object::new(ctx);
+
+        // Emit the event
+        event::emit(
+            CardCreated { 
+                id: object::uid_to_inner(&id), 
+                name: string::utf8(name), 
+                owner: tx_context::sender(ctx), 
+                title: string::utf8(title), 
+                contact: string::utf8(contact) 
+            }
+        );
 
         // Creating the new DevCard
         let devcard = DevCard {
-            id: object::new(ctx),
+            id: id,
             name: string::utf8(name),
-            address: tx_context::sender(ctx),
+            owner: tx_context::sender(ctx),
             title: string::utf8(title),
             img_url: url::new_unsafe_from_bytes(img_url),
             description: option::none(),
@@ -96,48 +124,57 @@ module devhub::devcard {
             open_to_work: true,
         };
 
-        // Sending new object to the sender of this transaction
-        transfer::transfer(devcard, tx_context::sender(ctx));
+        // Adding card to the table
+        object_table::add(&mut devhub.cards, devhub.counter, devcard);
     }
 
     // With this function the user can change his/her card's description
-    // First we check if the address that is sending the transaction is the owner of the card object
-    // Then we update the field
-    // Since description is an optional field we use swap_or_fill which returns the last value
-    // We get the value and delete it using, _= old_description
-    public entry fun change_description(card: &mut DevCard, new_description: vector<u8>, ctx: &mut TxContext) {
-        assert!(tx_context::sender(ctx) == card.address, NOT_THE_OWNER);
-        let old_description = option::swap_or_fill(&mut card.description, string::utf8(new_description));
-        _= old_description;
+    public entry fun update_card_description(devhub: &mut DevHub, new_description: vector<u8>, id: u64, ctx: &mut TxContext) {
+        let user_card = object_table::borrow_mut(&mut devhub.cards, id);
+        assert!(tx_context::sender(ctx) == user_card.owner, NOT_THE_OWNER);
+        let old_value = option::swap_or_fill(&mut user_card.description, string::utf8(new_description));
+
+        event::emit(DescriptionUpdated {
+            name: user_card.name,
+            owner: user_card.owner,
+            new_description: string::utf8(new_description)
+        });
+
+        _ = old_value;
     }
 
-    // With this function, users can change their work status. 
-    // First we check if the the transaction sender is the owner of the object
-    // Then we update the status
-    // Here we did not use swap_or_fill since the data is not optional
-    public entry fun change_work_status(card: &mut DevCard, status: bool, ctx: &mut TxContext) {
-        assert!(tx_context::sender(ctx) == card.address, NOT_THE_OWNER);
-        card.open_to_work = status;
+    // With this function user can deactivate his/her account by setting open_to_work field of his/her card to false
+    public entry fun deactivate_card(devhub: &mut DevHub, id: u64, ctx: &mut TxContext) {
+        let card = object_table::borrow_mut(&mut devhub.cards, id);
+        assert!(card.owner == tx_context::sender(ctx), NOT_THE_OWNER);
+        card.open_to_work = false;
     }
 
-    // With this function the owner of this contract can delete a card
-    // For this function the caller should have the HubOwner object
-    public entry fun delete_card(_: &HubOwner, devcard: DevCard) {
-        let DevCard {
-            id, 
-            name: _,
-            address: _,
-            title: _,
-            img_url: _,
-            description: _,
-            years_of_exp: _,
-            technologies: _,
-            portfolio: _,
-            contact: _,
-            open_to_work: _,
-        } = devcard;
-
-        object::delete(id);
+    // This function returns the card based on the id provided
+    public fun get_card_info(devhub: &DevHub, id: u64): (
+        String,
+        address,
+        String,
+        Url,
+        Option<String>,
+        u8,
+        String,
+        String,
+        String,
+        bool,
+    ) {
+        let card = object_table::borrow(&devhub.cards, id);
+        (
+            card.name,
+            card.owner,
+            card.title,
+            card.img_url,
+            card.description,
+            card.years_of_exp,
+            card.technologies,
+            card.portfolio,
+            card.contact,
+            card.open_to_work
+        )
     }
-
 }
